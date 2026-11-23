@@ -70,9 +70,11 @@ impl Device {
 impl DeviceImpl {
     /// This device's unique identifier
     pub fn id(&self) -> DeviceId {
-        let uuid = self
-            .peripheral
-            .dispatch(|peripheral| unsafe { Uuid::from_bluetooth_bytes(&peripheral.identifier().as_bytes()[..]) });
+        // From its string rather than `NSUUID::as_bytes`, whose `getUUIDBytes:` fails objc2's check of
+        // message encodings in debug builds, as objc2-foundation's docs warn
+        let uuid = self.peripheral.dispatch(|peripheral| unsafe {
+            Uuid::parse_str(&peripheral.identifier().UUIDString().to_string()).expect("NSUUID's string is a UUID")
+        });
         super::DeviceId(uuid)
     }
 
