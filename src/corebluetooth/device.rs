@@ -9,8 +9,6 @@ use objc2_foundation::{NSArray, NSData};
 
 use super::delegates::{PeripheralDelegate, PeripheralEvent};
 use super::dispatch::Dispatched;
-#[cfg(feature = "l2cap")]
-use super::l2cap_channel::{L2capChannelReader, L2capChannelWriter};
 use crate::device::ServicesChanged;
 use crate::error::ErrorKind;
 use crate::pairing::PairingAgent;
@@ -262,10 +260,7 @@ impl DeviceImpl {
         }
         debug!("open_l2cap_channel success {:?}", self.peripheral);
 
-        let reader = L2capChannelReader::new(l2capchannel.clone());
-        let writer = L2capChannelWriter::new(l2capchannel);
-
-        Ok(super::l2cap_channel::L2capChannel { reader, writer })
+        super::l2cap_channel::L2capChannel::open(l2capchannel)
     }
 }
 

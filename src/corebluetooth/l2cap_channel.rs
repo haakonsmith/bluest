@@ -1,38 +1,86 @@
-use core::ptr::NonNull;
+//! A CoreBluetooth L2CAP channel, read and written through the native socket under its streams.
+//!
+//! A channel's `NSInputStream` and `NSOutputStream` are toll-free bridged to CFStreams backed by one
+//! Unix socket, which `kCFStreamPropertySocketNativeHandle` gives. The streams are never opened.
+//! Scheduled on the main run loop, they never deliver their events in a program whose main thread
+//! doesn't run one, such as a tokio program's, so nothing is ever read. A thread each reads and
+//! writes a copy of the socket with blocking calls instead, through the same pipes as the other
+//! platforms. The reader's thread waits while its pipe is full, which leaves the data in the
+//! socket, so the channel's credits hold the sender up.
+
 use std::io::{Read, Write};
-use std::sync::{Arc, Mutex};
+use std::net::Shutdown;
+use std::os::fd::{BorrowedFd, RawFd};
+use std::os::unix::net::UnixStream;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::{fmt, pin};
 
 use futures_lite::io::{AsyncRead, AsyncWrite, BlockOn};
 use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
-use objc2::{AnyThread, DefinedClass, define_class, msg_send, sel};
 use objc2_core_bluetooth::CBL2CAPChannel;
-use objc2_foundation::{
-    NSDefaultRunLoopMode, NSInputStream, NSNotification, NSNotificationCenter, NSObject, NSObjectProtocol,
-    NSOutputStream, NSRunLoop, NSStream, NSStreamDelegate, NSStreamEvent, NSString,
-};
-use tracing::{debug, trace, warn};
+use objc2_core_foundation::{CFStreamPropertyKey, kCFStreamPropertySocketNativeHandle};
+use objc2_foundation::{NSData, NSString};
+use tracing::debug;
 
 use super::dispatch::Dispatched;
+use crate::Result;
+use crate::error::{Error, ErrorKind};
 use crate::l2cap_channel::{PIPE_CAPACITY, derive_async_read, derive_async_write};
 
-/// Utility struct to close the channel on drop.
+fn unavailable() -> Error {
+    Error::new(
+        ErrorKind::ConnectionFailed,
+        None,
+        "the L2CAP channel has no native socket",
+    )
+}
+
+fn socket_error(e: std::io::Error) -> Error {
+    Error::new(ErrorKind::ConnectionFailed, Some(Box::new(e)), "")
+}
+
+/// A copy of the channel's socket. CoreBluetooth keeps its own, so this one can be closed
+fn socket(channel: &CBL2CAPChannel) -> Result<UnixStream> {
+    // SAFETY: an extern static, which CoreFoundation defines
+    let key = unsafe { kCFStreamPropertySocketNativeHandle }.ok_or_else(unavailable)?;
+    // SAFETY: CFString is toll-free bridged to NSString, so the key is both, and objc2 has no safe
+    // conversion between them
+    let key: &NSString = unsafe { &*(key as *const CFStreamPropertyKey).cast::<NSString>() };
+    // SAFETY: a property read, which objc2 marks unsafe only as its binding isn't audited
+    let input = unsafe { channel.inputStream() }.ok_or_else(unavailable)?;
+
+    // A CFNativeSocketHandle in a CFData
+    let handle = input.propertyForKey(key).ok_or_else(unavailable)?;
+    let handle: Retained<NSData> = handle.downcast().map_err(|_| unavailable())?;
+    let fd = RawFd::from_ne_bytes(handle.to_vec().try_into().map_err(|_| unavailable())?);
+
+    // SAFETY: the channel's socket, which CoreBluetooth keeps open while the channel lives, and the
+    // caller holds the channel
+    let fd = unsafe { BorrowedFd::borrow_raw(fd) }
+        .try_clone_to_owned()
+        .map_err(socket_error)?;
+    let socket = UnixStream::from(fd);
+    // The file status flags are the socket's, shared with CoreBluetooth's copy, which nothing uses
+    // as its streams are never opened
+    socket.set_nonblocking(false).map_err(socket_error)?;
+
+    Ok(socket)
+}
+
+/// The socket, sent out of the dispatch queue's closure
+struct SendSocket(UnixStream);
+
+/// Keeps the channel open while its reader or writer lives, and shuts the socket when both are
+/// gone, which ends the threads blocked on it
 pub(super) struct L2capCloser {
-    channel: Dispatched<CBL2CAPChannel>,
+    _channel: Dispatched<CBL2CAPChannel>,
+    socket: UnixStream,
 }
 
 impl L2capCloser {
     fn close(&self) {
-        self.channel.dispatch(|channel| unsafe {
-            if let Some(c) = channel.inputStream() {
-                c.close()
-            }
-            if let Some(c) = channel.outputStream() {
-                c.close()
-            }
-        })
+        let _ = self.socket.shutdown(Shutdown::Both);
     }
 }
 
@@ -48,6 +96,62 @@ pub struct L2capChannel {
 }
 
 impl L2capChannel {
+    /// Opens `channel` for reading and writing through its socket
+    pub(super) fn open(channel: Dispatched<CBL2CAPChannel>) -> Result<Self> {
+        let socket = channel.dispatch(|channel| socket(channel).map(SendSocket))?.0;
+        let mut input = socket.try_clone().map_err(socket_error)?;
+        let mut output = socket.try_clone().map_err(socket_error)?;
+        let closer = Arc::new(L2capCloser {
+            _channel: channel,
+            socket,
+        });
+
+        let (read_rx, read_tx) = piper::pipe(PIPE_CAPACITY);
+        std::thread::spawn(move || {
+            let mut read_tx = BlockOn::new(read_tx);
+            let mut buf = [0u8; 4096];
+            loop {
+                match input.read(&mut buf) {
+                    Ok(0) => {
+                        debug!("L2CAP channel ended");
+                        return;
+                    }
+                    // Blocks while the pipe is full, which leaves the rest in the socket. Fails
+                    // once the reader is dropped
+                    Ok(read) => {
+                        if read_tx.write_all(&buf[..read]).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => {
+                        debug!("L2CAP channel read failed: {e}");
+                        return;
+                    }
+                }
+            }
+        });
+
+        let (write_rx, write_tx) = piper::pipe(PIPE_CAPACITY);
+        std::thread::spawn(move || {
+            // Ends once the writer is dropped or closed, and what it wrote has gone
+            if let Err(e) = std::io::copy(&mut BlockOn::new(write_rx), &mut output) {
+                debug!("L2CAP channel write failed: {e}");
+            }
+        });
+
+        Ok(Self {
+            reader: L2capChannelReader {
+                stream: read_rx,
+                _closer: closer.clone(),
+            },
+            writer: L2capChannelWriter {
+                stream: write_tx,
+                closer,
+            },
+        })
+    }
+
     pub fn split(self) -> (L2capChannelReader, L2capChannelWriter) {
         (self.reader, self.writer)
     }
@@ -60,32 +164,6 @@ derive_async_write!(L2capChannel, writer);
 pub struct L2capChannelReader {
     stream: piper::Reader,
     _closer: Arc<L2capCloser>,
-    _delegate: Retained<InputStreamDelegate>,
-}
-
-impl L2capChannelReader {
-    /// Creates a new L2capChannelReader.
-    pub(crate) fn new(channel: Dispatched<CBL2CAPChannel>) -> Self {
-        let (read_rx, read_tx) = piper::pipe(PIPE_CAPACITY);
-        let closer = Arc::new(L2capCloser {
-            channel: channel.clone(),
-        });
-
-        let delegate = channel.dispatch(|channel| unsafe {
-            let input_stream = channel.inputStream().unwrap();
-            let delegate = InputStreamDelegate::new(read_tx);
-            input_stream.setDelegate(Some(&ProtocolObject::from_retained(delegate.clone())));
-            input_stream.scheduleInRunLoop_forMode(&NSRunLoop::mainRunLoop(), NSDefaultRunLoopMode);
-            input_stream.open();
-            delegate
-        });
-
-        Self {
-            stream: read_rx,
-            _delegate: delegate,
-            _closer: closer,
-        }
-    }
 }
 
 derive_async_read!(L2capChannelReader, stream);
@@ -100,57 +178,15 @@ impl fmt::Debug for L2capChannelReader {
 pub struct L2capChannelWriter {
     stream: piper::Writer,
     closer: Arc<L2capCloser>,
-    _delegate: Retained<OutputStreamDelegate>,
-}
-
-impl L2capChannelWriter {
-    /// Creates a new L2capChannelWriter.
-    pub(crate) fn new(channel: Dispatched<CBL2CAPChannel>) -> Self {
-        let (write_rx, write_tx) = piper::pipe(PIPE_CAPACITY);
-        let closer = Arc::new(L2capCloser {
-            channel: channel.clone(),
-        });
-
-        let delegate = channel.dispatch(|channel| unsafe {
-            let output_stream = channel.outputStream().unwrap();
-            let delegate = OutputStreamDelegate::new(write_rx, Dispatched::retain(&output_stream));
-            output_stream.setDelegate(Some(&ProtocolObject::from_retained(delegate.clone())));
-            output_stream.scheduleInRunLoop_forMode(&NSRunLoop::mainRunLoop(), NSDefaultRunLoopMode);
-            output_stream.open();
-
-            let center = NSNotificationCenter::defaultCenter();
-            let name = NSString::from_str("ChannelWriteNotification");
-            center.addObserver_selector_name_object(&delegate, sel!(onNotified:), Some(&name), None);
-            delegate
-        });
-
-        Self {
-            stream: write_tx,
-            _delegate: delegate,
-            closer,
-        }
-    }
-
-    fn notify(&self) {
-        unsafe {
-            let name = NSString::from_str("ChannelWriteNotification");
-            let center = NSNotificationCenter::defaultCenter();
-            center.postNotificationName_object(&name, None);
-        }
-    }
 }
 
 impl AsyncWrite for L2capChannelWriter {
     fn poll_write(mut self: pin::Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
         let stream = pin::pin!(&mut self.stream);
-        let ret = stream.poll_write(cx, buf);
-        if matches!(ret, Poll::Ready(Ok(_))) {
-            self.notify();
-        }
-        ret
+        stream.poll_write(cx, buf)
     }
 
-    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_flush(mut self: pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let stream = pin::pin!(&mut self.stream);
         stream.poll_flush(cx)
     }
@@ -165,136 +201,5 @@ impl AsyncWrite for L2capChannelWriter {
 impl fmt::Debug for L2capChannelWriter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("L2capChannelWriter")
-    }
-}
-
-struct InputStreamDelegateIvars {
-    writer: Mutex<BlockOn<piper::Writer>>,
-}
-
-define_class!(
-    #[unsafe(super(NSObject))]
-    #[ivars = InputStreamDelegateIvars]
-    #[derive(PartialEq, Eq, Hash)]
-    struct InputStreamDelegate;
-
-    unsafe impl NSObjectProtocol for InputStreamDelegate {}
-
-    unsafe impl NSStreamDelegate for InputStreamDelegate {
-        #[unsafe(method(stream:handleEvent:))]
-        fn handle_event(&self, stream: &NSStream, event_code: NSStreamEvent) {
-            let input_stream = stream.downcast_ref::<NSInputStream>().unwrap();
-            if let NSStreamEvent::HasBytesAvailable = event_code {
-                // This is the only writer task, so there should never be contention on this lock
-                let mut writer = self.ivars().writer.try_lock().unwrap();
-                // This is the the only task that writes to the pipe so at least this many bytes will be available
-                let to_fill = writer.get_ref().capacity() - writer.get_ref().len();
-                let mut buf = vec![0u8; to_fill].into_boxed_slice();
-                let res = unsafe { input_stream.read_maxLength(NonNull::new_unchecked(buf.as_mut_ptr()), buf.len()) };
-                if res < 0 {
-                    debug!("Read Loop Error: Stream read failed");
-                    return;
-                }
-                let filled = res.try_into().unwrap();
-                if let Err(e) = writer.write_all(&buf[..filled]) {
-                    debug!("Read Loop Error: {:?}", e);
-                    unsafe {
-                        input_stream.setDelegate(None);
-                        input_stream.close();
-                    }
-                }
-            }
-        }
-    }
-);
-
-impl InputStreamDelegate {
-    pub fn new(writer: piper::Writer) -> Retained<Self> {
-        let ivars = InputStreamDelegateIvars {
-            writer: Mutex::new(BlockOn::new(writer)),
-        };
-        let this = InputStreamDelegate::alloc().set_ivars(ivars);
-        unsafe { msg_send![super(this), init] }
-    }
-}
-
-struct OutputStreamDelegateIvars {
-    receiver: Mutex<BlockOn<piper::Reader>>,
-    stream: Dispatched<NSOutputStream>,
-}
-
-define_class!(
-    #[unsafe(super(NSObject))]
-    #[ivars = OutputStreamDelegateIvars]
-    #[derive(PartialEq, Eq, Hash)]
-    struct OutputStreamDelegate;
-
-    unsafe impl NSObjectProtocol for OutputStreamDelegate {}
-
-    unsafe impl NSStreamDelegate for OutputStreamDelegate {
-        #[unsafe(method(stream:handleEvent:))]
-        fn handle_event(&self, stream: &NSStream, event_code: NSStreamEvent) {
-            let output_stream = stream.downcast_ref::<NSOutputStream>().unwrap();
-            if let NSStreamEvent::HasSpaceAvailable = event_code {
-                self.send_packet(output_stream)
-            }
-        }
-
-        #[unsafe(method(onNotified:))]
-        fn on_notified(&self, _n: &NSNotification) {
-            let stream = unsafe { self.ivars().stream.get() };
-            self.send_packet(stream)
-        }
-    }
-);
-
-impl OutputStreamDelegate {
-    pub fn new(receiver: piper::Reader, stream: Dispatched<NSOutputStream>) -> Retained<Self> {
-        let ivars = OutputStreamDelegateIvars {
-            receiver: Mutex::new(BlockOn::new(receiver)),
-            stream,
-        };
-        let this = OutputStreamDelegate::alloc().set_ivars(ivars);
-        unsafe { msg_send![super(this), init] }
-    }
-
-    fn send_packet(&self, output_stream: &NSOutputStream) {
-        let mut receiver = self.ivars().receiver.lock().unwrap();
-
-        // This is racy but there will always be at least this many bytesin the channel
-        let to_write = receiver.get_ref().len();
-        if to_write == 0 {
-            trace!("No data to write");
-            return;
-        }
-        let mut buf = vec![0u8; to_write];
-        let to_write = match receiver.read(&mut buf) {
-            Err(e) => {
-                warn!("Error reading from stream {:?}", e);
-                return;
-            }
-            Ok(0) => {
-                trace!("No more data to write");
-                self.close(output_stream);
-                return;
-            }
-            Ok(n) => n,
-        };
-
-        buf.truncate(to_write);
-        let res = unsafe { output_stream.write_maxLength(NonNull::new_unchecked(buf.as_mut_ptr()), buf.len()) };
-        if res < 0 {
-            debug!("Write Loop Error: Stream write failed");
-            self.close(output_stream);
-        }
-    }
-
-    fn close(&self, output_stream: &NSOutputStream) {
-        unsafe {
-            output_stream.setDelegate(None);
-            output_stream.close();
-            let center = NSNotificationCenter::defaultCenter();
-            center.removeObserver(self);
-        }
     }
 }

@@ -22,7 +22,7 @@ targets = [
 
 [features]
 unstable = []
-l2cap = ["dep:piper", "futures-lite/std", "futures-lite/alloc", "bluer/l2cap", "async-compat"]
+l2cap = ["dep:piper", "futures-lite/std", "futures-lite/alloc", "bluer/l2cap", "async-compat", "dep:objc2-core-foundation"]
 serde = ["dep:serde", "uuid/serde", "bluer/serde"]
 
 [dependencies]
@@ -74,6 +74,7 @@ piper = {version = "0.2.4", optional = true}
 objc2 = "0.6.1"
 objc2-foundation = "0.3.1"
 objc2-core-bluetooth = "0.3.1"
+objc2-core-foundation = { version = "0.3.2", optional = true }
 dispatch2 = "0.3.0"
 
 [[example]]
